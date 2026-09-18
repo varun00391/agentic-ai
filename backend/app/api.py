@@ -15,9 +15,11 @@ from app.db_models import (
     JobBatch,
     Membership,
     Organization,
+    OrganizationPolicy,
     Receipt,
     User,
 )
+from app.categorizer import CATEGORIES
 from app.deps import (
     AuthContext,
     WRITE_ROLES,
@@ -27,16 +29,25 @@ from app.deps import (
 )
 from app.duplicates import hash_file
 from app.document import SUPPORTED_CONTENT_TYPES
+from app.models import RunState
+from app.policy import default_policy_values
 from app.scan import scan_receipt
+from app.repository import ExpenseRepository
+from app.review import ReviewError, apply_review
 from app.schemas import (
     ExpenseDetail,
     ExpenseListResponse,
     IngestResponse,
     JobDetail,
+    JobProgress,
     JobSummary,
     LoginRequest,
     MeResponse,
+    MerchantMemoryItem,
+    OrganizationPolicyResponse,
+    OrganizationPolicyUpdate,
     OrganizationSummary,
+    ReviewRequest,
     SignupRequest,
     TokenResponse,
 )
@@ -124,6 +135,12 @@ def signup(
             role="owner",
         )
     )
+    session.add(
+        OrganizationPolicy(
+            organization_id=organization.id,
+            **default_policy_values(settings),
+        )
+    )
     session.flush()
     token = create_access_token(
         user.id, user.email, settings.jwt_secret, settings.jwt_expire_minutes
@@ -157,6 +174,55 @@ def login(
         display_name=user.display_name,
         organizations=_organizations_for(session, user.id),
     )
+
+
+@app.get("/api/v2/organization/policy", response_model=OrganizationPolicyResponse)
+def get_organization_policy(
+    auth: AuthContext = Depends(get_auth_context),
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> OrganizationPolicyResponse:
+    repository = ExpenseRepository(session, auth.organization.id)
+    policy = repository.get_or_create_policy(settings)
+    memories = repository.list_merchant_memories()
+    return _policy_response(policy, memories)
+
+
+@app.put("/api/v2/organization/policy", response_model=OrganizationPolicyResponse)
+def update_organization_policy(
+    payload: OrganizationPolicyUpdate,
+    auth: AuthContext = Depends(require_roles("owner", "admin")),
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> OrganizationPolicyResponse:
+    if payload.always_review_categories is not None:
+        unknown = sorted(set(payload.always_review_categories) - set(CATEGORIES))
+        if unknown:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported categories: {', '.join(unknown)}"
+            )
+    repository = ExpenseRepository(session, auth.organization.id)
+    clear_max = (
+        "max_auto_accept_minor_units" in payload.model_fields_set
+        and payload.max_auto_accept_minor_units is None
+    )
+    policy = repository.update_policy(
+        settings,
+        extraction_min_confidence=payload.extraction_min_confidence,
+        max_auto_accept_minor_units=payload.max_auto_accept_minor_units,
+        always_review_categories=payload.always_review_categories,
+        review_all=payload.review_all,
+        clear_max_auto_accept=clear_max,
+    )
+    session.add(
+        AuditEvent(
+            organization_id=auth.organization.id,
+            actor_user_id=auth.user.id,
+            event_type="organization.policy_updated",
+            payload=payload.model_dump(exclude_unset=True),
+        )
+    )
+    return _policy_response(policy, repository.list_merchant_memories())
 
 
 @app.get("/api/v2/organizations", response_model=list[OrganizationSummary])
@@ -296,19 +362,7 @@ def get_job(
             Expense.organization_id == auth.organization.id,
         )
     )
-    return JobDetail(
-        job_id=job.id,
-        batch_id=job.batch_id,
-        receipt_id=job.receipt_id,
-        organization_id=job.organization_id,
-        filename=receipt.filename if receipt else "",
-        status=job.status,
-        attempt_count=job.attempt_count,
-        error_message=job.error_message,
-        expense_id=expense.id if expense else None,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-    )
+    return _job_detail(job, receipt.filename if receipt else "", expense)
 
 
 @app.get("/api/v2/batches/{batch_id}", response_model=IngestResponse)
@@ -356,6 +410,107 @@ def get_expense(
     return _expense_detail(expense, receipt.filename if receipt else None)
 
 
+@app.post("/api/v2/expenses/{expense_id}/review", response_model=ExpenseDetail)
+def review_expense(
+    expense_id: str,
+    payload: ReviewRequest,
+    auth: AuthContext = Depends(require_roles(*WRITE_ROLES)),
+    session: Session = Depends(get_session),
+    settings: Settings = Depends(get_settings),
+) -> ExpenseDetail:
+    expense = session.get(Expense, expense_id)
+    if expense is None or expense.organization_id != auth.organization.id:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    if auth.role == "member" and expense.submitted_by_user_id != auth.user.id:
+        raise HTTPException(status_code=404, detail="Expense not found")
+    try:
+        expense = apply_review(
+            session,
+            settings,
+            expense,
+            auth.user.id,
+            payload.decision,
+            merchant=payload.merchant,
+            transaction_date=payload.transaction_date,
+            total=payload.total,
+            category=payload.category,
+            reason=payload.reason,
+        )
+    except ReviewError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    receipt = session.get(Receipt, expense.receipt_id)
+    return _expense_detail(expense, receipt.filename if receipt else None)
+
+
+def _job_detail(job: Job, filename: str, expense: Expense | None) -> JobDetail:
+    progress = _progress_from_checkpoint(job.checkpoint_json)
+    updates: dict = {}
+    if not progress.trace and expense and expense.agent_trace_json:
+        updates["trace"] = expense.agent_trace_json
+    if not progress.final_status and expense is not None:
+        updates["final_status"] = expense.status
+    if updates:
+        progress = progress.model_copy(update=updates)
+    return JobDetail(
+        job_id=job.id,
+        batch_id=job.batch_id,
+        receipt_id=job.receipt_id,
+        organization_id=job.organization_id,
+        filename=filename,
+        status=job.status,
+        attempt_count=job.attempt_count,
+        error_message=job.error_message,
+        expense_id=expense.id if expense else None,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        progress=progress,
+    )
+
+
+def _progress_from_checkpoint(raw: dict | None) -> JobProgress:
+    if not raw:
+        return JobProgress()
+    try:
+        state = RunState.model_validate(raw)
+    except Exception:
+        return JobProgress()
+    extracted = state.extracted
+    return JobProgress(
+        step_count=state.step_count,
+        current_tool=state.current_tool,
+        current_reason=state.current_reason,
+        current_arguments=state.current_arguments,
+        merchant=extracted.merchant if extracted else None,
+        total=extracted.total if extracted else None,
+        currency=extracted.currency if extracted else None,
+        category=state.category,
+        extraction_confidence=extracted.confidence if extracted else None,
+        extraction_source=extracted.extraction_source if extracted else None,
+        policy_decision=state.policy_decision,
+        final_status=state.final_status,
+        item_index=state.item_index,
+        item_count=len(state.extracted_items),
+        trace=state.trace,
+    )
+
+
+def _policy_response(policy, memories) -> OrganizationPolicyResponse:
+    return OrganizationPolicyResponse(
+        extraction_min_confidence=policy.extraction_min_confidence,
+        max_auto_accept_minor_units=policy.max_auto_accept_minor_units,
+        always_review_categories=list(policy.always_review_categories or []),
+        review_all=policy.review_all,
+        merchant_memories=[
+            MerchantMemoryItem(
+                merchant=item.merchant_display or item.merchant_normalized,
+                category=item.category,
+                updated_at=item.updated_at,
+            )
+            for item in memories
+        ],
+    )
+
+
 def _expense_detail(expense: Expense, filename: str | None) -> ExpenseDetail:
     return ExpenseDetail(
         expense_id=expense.id,
@@ -373,6 +528,8 @@ def _expense_detail(expense: Expense, filename: str | None) -> ExpenseDetail:
         duplicate_of_expense_id=expense.duplicate_of_expense_id,
         duplicate_match_type=expense.duplicate_match_type,
         policy_decision=expense.policy_decision,
+        extraction_confidence=expense.extraction_confidence,
+        extraction_source=expense.extraction_source,
         step_count=expense.agent_step_count,
         trace=expense.agent_trace_json or [],
         created_at=expense.created_at,

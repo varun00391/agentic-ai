@@ -57,9 +57,10 @@ def settings(tmp_path: Path) -> Settings:
         jwt_secret="test-secret-key",
         object_storage_path=tmp_path / "objects",
         planner="rule_based",
+        groq_api_key=None,
         bootstrap_email=None,
         bootstrap_password=None,
-        max_agent_steps=16,
+        max_agent_steps=80,
         max_tool_retries=2,
     )
 

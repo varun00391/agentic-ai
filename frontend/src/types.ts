@@ -28,6 +28,47 @@ export type JobSummary = {
   status: string;
 };
 
+export type TraceEvent = {
+  step: number;
+  tool: string;
+  reason: string;
+  success: boolean;
+  observation: string;
+  created_at?: string;
+};
+
+export type JobProgress = {
+  step_count: number;
+  current_tool: string | null;
+  current_reason: string | null;
+  current_arguments: Record<string, unknown>;
+  merchant: string | null;
+  total: string | null;
+  currency: string | null;
+  category: string | null;
+  extraction_confidence: number | null;
+  extraction_source: string | null;
+  policy_decision: string | null;
+  final_status: string | null;
+  item_index: number;
+  item_count: number;
+  trace: TraceEvent[];
+};
+
+export type MerchantMemory = {
+  merchant: string;
+  category: string;
+  updated_at: string;
+};
+
+export type OrganizationPolicy = {
+  extraction_min_confidence: number;
+  max_auto_accept_minor_units: number | null;
+  always_review_categories: string[];
+  review_all: boolean;
+  merchant_memories: MerchantMemory[];
+};
+
 export type JobDetail = JobSummary & {
   batch_id: string | null;
   organization_id: string;
@@ -36,17 +77,15 @@ export type JobDetail = JobSummary & {
   expense_id: string | null;
   created_at: string;
   updated_at: string;
+  progress: JobProgress;
 };
 
-export type TraceEvent = {
-  step: number;
-  tool: string;
-  reason: string;
-  success: boolean;
-  observation: string;
-};
-
-export type ExpenseStatus = "accepted" | "needs_review" | "duplicate" | "failed";
+export type ExpenseStatus =
+  | "accepted"
+  | "needs_review"
+  | "duplicate"
+  | "failed"
+  | "rejected";
 
 export type ExpenseDetail = {
   expense_id: string;
@@ -64,6 +103,8 @@ export type ExpenseDetail = {
   duplicate_of_expense_id: string | null;
   duplicate_match_type: string | null;
   policy_decision: string | null;
+  extraction_confidence: number | null;
+  extraction_source: string | null;
   step_count: number;
   trace: TraceEvent[];
   created_at: string;

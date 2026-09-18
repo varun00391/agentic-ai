@@ -1,11 +1,12 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
-from app.db_models import Base, Membership, Organization, User
+from app.db_models import Base, Membership, Organization, OrganizationPolicy, User
+from app.policy import default_policy_values
 from app.security import hash_password, slugify
 
 
@@ -25,7 +26,29 @@ def init_engine(settings: Settings) -> Engine:
     _engine = create_db_engine(settings.database_url)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     Base.metadata.create_all(_engine)
+    _ensure_expense_columns(_engine)
     return _engine
+
+
+def _ensure_expense_columns(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if "expenses" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("expenses")}
+    statements: list[str] = []
+    if "extraction_confidence" not in columns:
+        statements.append(
+            "ALTER TABLE expenses ADD COLUMN extraction_confidence FLOAT"
+        )
+    if "extraction_source" not in columns:
+        statements.append(
+            "ALTER TABLE expenses ADD COLUMN extraction_source VARCHAR(16)"
+        )
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def get_session_factory() -> sessionmaker[Session]:
@@ -72,6 +95,12 @@ def bootstrap_if_needed(settings: Settings) -> None:
                 organization_id=organization.id,
                 user_id=user.id,
                 role="owner",
+            )
+        )
+        session.add(
+            OrganizationPolicy(
+                organization_id=organization.id,
+                **default_policy_values(settings),
             )
         )
         session.commit()

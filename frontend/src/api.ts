@@ -3,6 +3,7 @@ import type {
   JobDetail,
   JobSummary,
   MeResponse,
+  OrganizationPolicy,
   TokenResponse,
 } from "./types";
 
@@ -99,6 +100,49 @@ export const api = {
     return request<ExpenseDetail>(`/api/v2/expenses/${expenseId}`, {
       token,
       organizationId,
+    });
+  },
+  reviewExpense(
+    token: string,
+    organizationId: string,
+    expenseId: string,
+    body: {
+      decision: "approve" | "edit" | "reject";
+      merchant?: string;
+      transaction_date?: string;
+      total?: string;
+      category?: string;
+      reason?: string;
+    },
+  ) {
+    return request<ExpenseDetail>(`/api/v2/expenses/${expenseId}/review`, {
+      method: "POST",
+      token,
+      organizationId,
+      body: JSON.stringify(body),
+    });
+  },
+  getPolicy(token: string, organizationId: string) {
+    return request<OrganizationPolicy>("/api/v2/organization/policy", {
+      token,
+      organizationId,
+    });
+  },
+  updatePolicy(
+    token: string,
+    organizationId: string,
+    body: {
+      extraction_min_confidence?: number;
+      max_auto_accept_minor_units?: number | null;
+      always_review_categories?: string[];
+      review_all?: boolean;
+    },
+  ) {
+    return request<OrganizationPolicy>("/api/v2/organization/policy", {
+      method: "PUT",
+      token,
+      organizationId,
+      body: JSON.stringify(body),
     });
   },
 };

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -126,6 +126,47 @@ class Job(Base):
     )
 
 
+class OrganizationPolicy(Base):
+    __tablename__ = "organization_policies"
+
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), primary_key=True
+    )
+    extraction_min_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    max_auto_accept_minor_units: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    always_review_categories: Mapped[list] = mapped_column(JSON, nullable=False)
+    review_all: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class MerchantMemory(Base):
+    __tablename__ = "merchant_memories"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "merchant_normalized",
+            name="uq_merchant_memory",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+    merchant_normalized: Mapped[str] = mapped_column(String(200), nullable=False)
+    merchant_display: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Expense(Base):
     __tablename__ = "expenses"
 
@@ -157,6 +198,8 @@ class Expense(Base):
     )
     duplicate_match_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     policy_decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    extraction_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    extraction_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     agent_step_count: Mapped[int] = mapped_column(Integer, nullable=False)
     agent_trace_json: Mapped[list] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.agent import ExpenseAgent
 from app.config import Settings
-from app.db_models import Job, Receipt
+from app.db_models import Expense, Job, Receipt
 from app.models import RunState
 from app.repository import ExpenseRepository
 from app.storage import ObjectStorage
@@ -64,6 +64,12 @@ def process_job(session: Session, settings: Settings, job: Job) -> Job:
             submitted_by_user_id=job.created_by_user_id,
         )
 
+    policy = repository.get_or_create_policy(settings)
+    state.policy_min_confidence = policy.extraction_min_confidence
+    state.current_reason = state.current_reason or "Starting on this receipt"
+    repository.save_checkpoint(job.id, state)
+    session.commit()
+
     def on_checkpoint(_state: RunState) -> None:
         job.heartbeat_at = datetime.now(timezone.utc)
         session.commit()
@@ -76,17 +82,32 @@ def process_job(session: Session, settings: Settings, job: Job) -> Job:
     )
     try:
         state = agent.process(state)
-        job.status = "succeeded"
-        job.error_message = None
-        if not settings.retain_ocr_text and job.checkpoint_json:
-            checkpoint = dict(job.checkpoint_json)
-            checkpoint["text"] = None
-            job.checkpoint_json = checkpoint
-        repository.record_audit(
-            "job.completed",
-            job.created_by_user_id,
-            {"job_id": job.id, "status": state.final_status},
+        needs_review = session.scalar(
+            select(Expense.id).where(
+                Expense.job_id == job.id,
+                Expense.status == "needs_review",
+            )
         )
+        if state.awaiting_human or needs_review:
+            job.status = "waiting_for_review"
+            job.error_message = None
+            repository.record_audit(
+                "job.waiting_for_review",
+                job.created_by_user_id,
+                {"job_id": job.id, "status": state.final_status},
+            )
+        else:
+            job.status = "succeeded"
+            job.error_message = None
+            if not settings.retain_ocr_text and job.checkpoint_json:
+                checkpoint = dict(job.checkpoint_json)
+                checkpoint["text"] = None
+                job.checkpoint_json = checkpoint
+            repository.record_audit(
+                "job.completed",
+                job.created_by_user_id,
+                {"job_id": job.id, "status": state.final_status},
+            )
         session.commit()
     except Exception as exc:
         session.rollback()

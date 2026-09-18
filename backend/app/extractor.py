@@ -1,6 +1,9 @@
 import re
 
+from app.config import Settings
+from app.llm_extract import LlmExtractionError, extract_expenses_with_llm
 from app.models import ExtractedExpense
+from app.normalizer import _normalize_amount
 
 
 DATE_PATTERNS = [
@@ -36,14 +39,50 @@ ENTRY_SPLIT = re.compile(
 )
 
 
-def extract_expense_fields(text: str, primary_currency: str) -> ExtractedExpense:
-    entries = extract_expense_entries(text, primary_currency)
+def extract_expense_fields(
+    text: str,
+    primary_currency: str,
+    settings: Settings | None = None,
+) -> ExtractedExpense:
+    entries = extract_expense_entries(text, primary_currency, settings)
     if entries:
         return entries[0]
-    return ExtractedExpense(currency=primary_currency)
+    return ExtractedExpense(
+        currency=primary_currency,
+        confidence=0.1,
+        extraction_source="regex",
+    )
 
 
-def extract_expense_entries(text: str, primary_currency: str) -> list[ExtractedExpense]:
+def extract_expense_entries(
+    text: str,
+    primary_currency: str,
+    settings: Settings | None = None,
+    hint: str | None = None,
+) -> list[ExtractedExpense]:
+    regex_items = [
+        item.model_copy(
+            update={
+                "confidence": _regex_confidence(item),
+                "extraction_source": "regex",
+            }
+        )
+        for item in _extract_expense_entries_regex(text, primary_currency)
+    ]
+    if settings is None or not settings.groq_api_key:
+        return regex_items
+    try:
+        llm_items = extract_expenses_with_llm(
+            text, primary_currency, settings, hint=hint
+        )
+    except (LlmExtractionError, Exception):
+        return regex_items
+    return _prefer_llm_or_regex(llm_items, regex_items)
+
+
+def _extract_expense_entries_regex(
+    text: str, primary_currency: str
+) -> list[ExtractedExpense]:
     currency = _extract_currency(text) or primary_currency
     statement_entries = _extract_statement_entries(text, currency)
     if len(statement_entries) >= 2:
@@ -199,3 +238,55 @@ def _unique_entries(entries: list[ExtractedExpense]) -> list[ExtractedExpense]:
         seen.add(key)
         unique.append(entry)
     return unique
+
+
+def _regex_confidence(item: ExtractedExpense) -> float:
+    score = 0.15
+    if item.merchant:
+        score += 0.3
+    if item.total:
+        score += 0.35
+    if item.transaction_date:
+        score += 0.2
+    return round(min(score, 1.0), 2)
+
+
+def _prefer_llm_or_regex(
+    llm_items: list[ExtractedExpense],
+    regex_items: list[ExtractedExpense],
+) -> list[ExtractedExpense]:
+    calibrated = _calibrate_llm_items(llm_items, regex_items)
+    # Regex is stronger on multi-vendor UPI screenshots when the model collapses them.
+    if len(regex_items) >= 2 and len(calibrated) < len(regex_items):
+        return regex_items
+    return calibrated
+
+
+def _calibrate_llm_items(
+    llm_items: list[ExtractedExpense],
+    regex_items: list[ExtractedExpense],
+) -> list[ExtractedExpense]:
+    regex_totals = {
+        amount
+        for item in regex_items
+        if (amount := _normalize_amount(item.total)) is not None
+    }
+    calibrated: list[ExtractedExpense] = []
+    for item in llm_items:
+        confidence = item.confidence
+        if not item.merchant or not item.total:
+            confidence = min(confidence, 0.45)
+        llm_total = _normalize_amount(item.total)
+        if llm_total is not None and llm_total in regex_totals:
+            confidence = max(confidence, 0.85)
+        elif regex_totals and llm_total is not None and llm_total not in regex_totals:
+            confidence = min(confidence, 0.6)
+        calibrated.append(
+            item.model_copy(
+                update={
+                    "confidence": round(min(max(confidence, 0.0), 1.0), 2),
+                    "extraction_source": "llm",
+                }
+            )
+        )
+    return calibrated

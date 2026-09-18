@@ -5,6 +5,7 @@ import { DashboardPage } from "./DashboardPage";
 import { LoginPage } from "./LoginPage";
 import { ProcessPage } from "./ProcessPage";
 import { RequireAuth } from "./RequireAuth";
+import { SettingsPage } from "./SettingsPage";
 import { SignupPage } from "./SignupPage";
 
 export default function App() {
@@ -18,6 +19,7 @@ export default function App() {
             <Route element={<AppShell />}>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/process" element={<ProcessPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
               <Route path="/process/:expenseId" element={<LegacyExpenseRedirect />} />
               <Route path="/expenses" element={<Navigate to="/process" replace />} />
               <Route path="/expenses/:expenseId" element={<LegacyExpenseRedirect />} />

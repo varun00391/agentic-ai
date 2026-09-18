@@ -12,6 +12,7 @@ const STATUS_COLORS = {
   needs_review: "#b45309",
   duplicate: "#0369a1",
   failed: "#be123c",
+  rejected: "#be123c",
 };
 
 export function DashboardPage() {
@@ -97,6 +98,7 @@ export function DashboardPage() {
                 <th className="px-5 py-3">Merchant</th>
                 <th className="px-5 py-3">Amount</th>
                 <th className="px-5 py-3">Status</th>
+                <th className="px-5 py-3" />
               </tr>
             </thead>
             <tbody>
@@ -109,6 +111,14 @@ export function DashboardPage() {
                   </td>
                   <td className="px-5 py-3">
                     <StatusPill status={expense.status} />
+                  </td>
+                  <td className="px-5 py-3 text-right">
+                    <Link
+                      className="rounded-full border border-line px-3 py-1 text-xs font-semibold hover:bg-void hover:text-paper"
+                      to={`/process?view=${expense.expense_id}`}
+                    >
+                      {expense.status === "needs_review" ? "Review" : "View"}
+                    </Link>
                   </td>
                 </tr>
               ))}
@@ -154,7 +164,9 @@ function summarize(items: ExpenseDetail[]) {
   const accepted = items.filter((item) => item.status === "accepted").length;
   const spendMinor = items.reduce((sum, item) => sum + (item.total_minor_units ?? 0), 0);
   const currency = items.find((item) => item.currency)?.currency ?? "USD";
-  const outcomes = (["accepted", "needs_review", "duplicate", "failed"] as const).map((status) => ({
+  const outcomes = (
+    ["accepted", "needs_review", "duplicate", "failed", "rejected"] as const
+  ).map((status) => ({
     label: status.replaceAll("_", " "),
     value: items.filter((item) => item.status === status).length,
     color: STATUS_COLORS[status],

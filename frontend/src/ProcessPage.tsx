@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState, type ChangeEvent, type DragEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "./api";
+import { AgentActivity, jobIsLive } from "./AgentActivity";
 import { useAuth } from "./auth";
 import { ExpenseDrawer } from "./ExpenseDrawer";
-import { formatCategory, formatMoney } from "./format";
+import { emptyJobProgress, formatCategory, formatMoney } from "./format";
 import type { ExpenseDetail, JobDetail } from "./types";
 import { Button, StatusPill } from "./ui";
 
@@ -17,10 +18,18 @@ function jobsKey(orgId: string) {
 function readStoredJobs(orgId: string): JobDetail[] {
   try {
     const raw = sessionStorage.getItem(jobsKey(orgId));
-    return raw ? (JSON.parse(raw) as JobDetail[]) : [];
+    const parsed = raw ? (JSON.parse(raw) as JobDetail[]) : [];
+    return parsed.map(normalizeJob);
   } catch {
     return [];
   }
+}
+
+function normalizeJob(job: JobDetail): JobDetail {
+  return {
+    ...job,
+    progress: job.progress ?? emptyJobProgress(),
+  };
 }
 
 function writeStoredJobs(orgId: string, jobs: JobDetail[]) {
@@ -36,6 +45,7 @@ export function ProcessPage() {
   const [error, setError] = useState("");
   const [jobs, setJobs] = useState<JobDetail[]>([]);
   const [expenses, setExpenses] = useState<ExpenseDetail[]>([]);
+  const [watchingId, setWatchingId] = useState<string | null>(null);
   const viewId = searchParams.get("view");
 
   useEffect(() => {
@@ -43,6 +53,7 @@ export function ProcessPage() {
       return;
     }
     setJobs(readStoredJobs(currentOrg.id));
+    setWatchingId(null);
   }, [currentOrg]);
 
   useEffect(() => {
@@ -57,22 +68,23 @@ export function ProcessPage() {
       });
   }, [token, currentOrg]);
 
+  const liveCount = jobs.filter((job) => jobIsLive(job.status)).length;
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+
   useEffect(() => {
-    if (!token || !currentOrg || jobs.length === 0) {
+    if (!token || !currentOrg || liveCount === 0) {
       return;
     }
-    const pending = jobs.filter((job) => job.status === "queued" || job.status === "running");
-    if (pending.length === 0) {
-      return;
-    }
-    const timer = window.setInterval(async () => {
+    const tick = async () => {
+      const current = jobsRef.current;
       const updates = await Promise.all(
-        jobs.map(async (job) => {
-          if (job.status !== "queued" && job.status !== "running") {
+        current.map(async (job) => {
+          if (!jobIsLive(job.status)) {
             return job;
           }
           try {
-            return await api.getJob(token, currentOrg.id, job.job_id);
+            return normalizeJob(await api.getJob(token, currentOrg.id, job.job_id));
           } catch {
             return job;
           }
@@ -80,16 +92,52 @@ export function ProcessPage() {
       );
       setJobs(updates);
       writeStoredJobs(currentOrg.id, updates);
-      if (updates.some((job) => job.status !== "queued" && job.status !== "running")) {
+      if (updates.some((job) => !jobIsLive(job.status))) {
         const payload = await api.listExpenses(token, currentOrg.id);
         setExpenses(payload.items);
       }
-    }, 2000);
+    };
+    void tick();
+    const timer = window.setInterval(() => {
+      void tick();
+    }, 800);
     return () => window.clearInterval(timer);
-  }, [jobs, token, currentOrg]);
+  }, [liveCount, token, currentOrg]);
 
   const rows = useMemo(() => mergeRows(jobs, expenses), [jobs, expenses]);
   const selectedExpense = expenses.find((item) => item.expense_id === viewId);
+  const watchedJob =
+    jobs.find((job) => job.job_id === watchingId) ??
+    jobs.find((job) => jobIsLive(job.status)) ??
+    jobs[0] ??
+    null;
+  const watchedJobId = watchedJob?.job_id ?? null;
+
+  useEffect(() => {
+    if (!token || !currentOrg || !watchedJobId) {
+      return;
+    }
+    let cancelled = false;
+    api
+      .getJob(token, currentOrg.id, watchedJobId)
+      .then((job) => {
+        if (cancelled) {
+          return;
+        }
+        const updated = normalizeJob(job);
+        setJobs((current) => {
+          const next = current.map((item) =>
+            item.job_id === updated.job_id ? updated : item,
+          );
+          writeStoredJobs(currentOrg.id, next);
+          return next;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [watchedJobId, token, currentOrg]);
 
   function openView(id: string) {
     const next = new URLSearchParams(searchParams);
@@ -123,11 +171,13 @@ export function ProcessPage() {
       const details = await Promise.all(
         result.jobs.map((job) => api.getJob(token, currentOrg.id, job.job_id)),
       );
-      const next = [...details, ...jobs].filter(
+      const normalized = details.map(normalizeJob);
+      const next = [...normalized, ...jobs].filter(
         (job, index, all) => all.findIndex((item) => item.job_id === job.job_id) === index,
       );
       setJobs(next);
       writeStoredJobs(currentOrg.id, next);
+      setWatchingId(normalized[0]?.job_id ?? null);
       setFiles([]);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Upload failed");
@@ -141,8 +191,8 @@ export function ProcessPage() {
       <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">Work</p>
       <h1 className="font-display mt-2 text-4xl">Process</h1>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
-        Upload one or more receipts here. The agent reads each file, then every result
-        appears in the table below — merchant, date, amount, category, and status.
+        Upload one or more receipts here. Watch the agent read the file, decide each
+        step, and fill merchant, date, amount, and category as it works.
       </p>
 
       <form
@@ -214,11 +264,56 @@ export function ProcessPage() {
         {error ? <p className="mt-3 text-sm text-rose-800">{error}</p> : null}
       </form>
 
+      {watchedJob ? (
+        <section className="mt-8">
+          {jobs.length > 1 ? (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {jobs.slice(0, 8).map((job) => (
+                <button
+                  key={job.job_id}
+                  className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${
+                    job.job_id === watchedJob.job_id
+                      ? "border-void bg-void text-paper"
+                      : "border-line bg-card text-ink hover:bg-paper"
+                  }`}
+                  type="button"
+                  onClick={() => setWatchingId(job.job_id)}
+                >
+                  {job.filename}
+                  {jobIsLive(job.status) ? " · live" : ""}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <AgentActivity
+            filename={watchedJob.filename}
+            status={watchedJob.status}
+            progress={watchedJob.progress}
+            errorMessage={watchedJob.error_message}
+            footer={
+              watchedJob.expense_id ? (
+                <button
+                  className="text-sm font-semibold underline decoration-line underline-offset-4"
+                  type="button"
+                  onClick={() => openView(watchedJob.expense_id!)}
+                >
+                  {watchedJob.status === "waiting_for_review" ? "Review this receipt" : "Open receipt details"}
+                </button>
+              ) : (
+                <p className="text-xs text-muted">
+                  Steps appear here as the agent thinks, calls tools, and retries.
+                </p>
+              )
+            }
+          />
+        </section>
+      ) : null}
+
       <section className="mt-8">
         <div className="mb-3 flex items-end justify-between gap-4">
           <div>
             <h2 className="text-sm font-semibold">All files</h2>
-            <p className="text-xs text-muted">{rows.length} rows · live jobs refresh until they finish</p>
+            <p className="text-xs text-muted">{rows.length} rows · agent steps refresh while a file is running</p>
           </div>
         </div>
         <div className="overflow-x-auto rounded-3xl border border-line bg-card">
@@ -264,7 +359,15 @@ export function ProcessPage() {
                           type="button"
                           onClick={() => openView(row.expenseId!)}
                         >
-                          View
+                          {row.status === "needs_review" ? "Review" : "View"}
+                        </button>
+                      ) : row.jobId ? (
+                        <button
+                          className="rounded-full border border-line px-3 py-1 text-xs font-semibold hover:bg-void hover:text-paper"
+                          type="button"
+                          onClick={() => setWatchingId(row.jobId)}
+                        >
+                          Watch
                         </button>
                       ) : (
                         <span className="text-xs text-muted">Processing</span>
@@ -277,7 +380,18 @@ export function ProcessPage() {
           </table>
         </div>
       </section>
-      <ExpenseDrawer expenseId={viewId} initial={selectedExpense} onClose={closeView} />
+      <ExpenseDrawer
+        expenseId={viewId}
+        initial={selectedExpense}
+        onClose={closeView}
+        onReviewed={(expense) => {
+          setExpenses((current) =>
+            current.map((item) =>
+              item.expense_id === expense.expense_id ? expense : item,
+            ),
+          );
+        }}
+      />
     </main>
   );
 }
@@ -291,6 +405,7 @@ type Row = {
   category: string;
   status: string;
   expenseId: string | null;
+  jobId: string | null;
   createdAt: string;
 };
 
@@ -305,6 +420,7 @@ function mergeRows(jobs: JobDetail[], expenses: ExpenseDetail[]): Row[] {
     category: formatCategory(expense.category),
     status: expense.status,
     expenseId: expense.expense_id,
+    jobId: expense.job_id,
     createdAt: expense.created_at,
   }));
   const fromJobs: Row[] = jobs
@@ -312,12 +428,15 @@ function mergeRows(jobs: JobDetail[], expenses: ExpenseDetail[]): Row[] {
     .map((job) => ({
       id: job.job_id,
       filename: job.filename,
-      merchant: "—",
+      merchant: job.progress.merchant ?? "—",
       date: "—",
-      amount: "—",
-      category: "—",
+      amount: job.progress.total
+        ? `${job.progress.currency ? `${job.progress.currency} ` : ""}${job.progress.total}`
+        : "—",
+      category: formatCategory(job.progress.category),
       status: job.status,
       expenseId: job.expense_id,
+      jobId: job.job_id,
       createdAt: job.created_at,
     }));
   return [...fromJobs, ...fromExpenses].sort((a, b) => b.createdAt.localeCompare(a.createdAt));

@@ -6,6 +6,7 @@ import { Button, Mark } from "./ui";
 const NAV = [
   { to: "/", label: "Dashboard", end: true, icon: DashboardIcon },
   { to: "/process", label: "Process", end: false, icon: ProcessIcon },
+  { to: "/settings", label: "Policy", end: false, icon: PolicyIcon },
 ];
 
 export function AppShell() {
@@ -200,6 +201,26 @@ function ProcessIcon() {
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path
         d="M3 11.5V13a1.5 1.5 0 0 0 1.5 1.5h7A1.5 1.5 0 0 0 13 13v-1.5M8 2.5v8M5 7.5 8 10.5 11 7.5"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PolicyIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path
+        d="M8 2.5 3.5 4.5v4.2c0 2.7 1.9 4.4 4.5 5.3 2.6-.9 4.5-2.6 4.5-5.3V4.5L8 2.5Z"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M6.2 8.1 7.4 9.3 9.8 6.7"
         stroke="currentColor"
         strokeWidth="1.4"
         strokeLinecap="round"

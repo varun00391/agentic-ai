@@ -19,8 +19,16 @@ KEYWORDS = {
     "education": ("school", "college", "course", "book", "tuition"),
 }
 
+CATEGORIES = (*KEYWORDS.keys(), "other")
 
-def categorize_expense(merchant: str | None, document_text: str) -> str:
+
+def categorize_expense(
+    merchant: str | None,
+    document_text: str,
+    remembered_category: str | None = None,
+) -> str:
+    if remembered_category in CATEGORIES:
+        return remembered_category
     searchable = f"{merchant or ''} {document_text}".casefold()
     scores = {
         category: sum(keyword in searchable for keyword in keywords)

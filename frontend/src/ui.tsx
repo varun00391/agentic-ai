@@ -48,11 +48,13 @@ export function Button({
   children,
   tone = "primary",
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { tone?: "primary" | "ghost" }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { tone?: "primary" | "ghost" | "danger" }) {
   const styles =
     tone === "primary"
       ? "bg-void text-paper hover:bg-ink disabled:opacity-50"
-      : "text-muted hover:text-ink";
+      : tone === "danger"
+        ? "border border-rose-200 bg-rose-50 text-rose-950 hover:bg-rose-100 disabled:opacity-50"
+        : "text-muted hover:text-ink";
   return (
     <button
       {...props}
@@ -68,9 +70,11 @@ export function StatusPill({ status }: { status: string }) {
     accepted: "bg-emerald-950 text-emerald-50",
     succeeded: "bg-emerald-950 text-emerald-50",
     needs_review: "bg-amber-100 text-amber-950",
+    waiting_for_review: "bg-amber-100 text-amber-950",
     running: "bg-amber-100 text-amber-950",
     duplicate: "bg-sky-100 text-sky-950",
     failed: "bg-rose-100 text-rose-950",
+    rejected: "bg-rose-100 text-rose-950",
     dead_letter: "bg-rose-100 text-rose-950",
     queued: "bg-stone-200 text-stone-800",
   };

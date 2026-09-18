@@ -2,12 +2,14 @@ from dataclasses import dataclass
 
 from app.categorizer import categorize_expense
 from app.config import Settings
-from app.document import extract_document_text
+from app.document import extract_document_text, extract_document_text_with_vision
 from app.duplicates import expense_fingerprint
 from app.evaluator import evaluate_final_status
 from app.extractor import extract_expense_entries
+from app.items import advance_to_next_item, current_item_label
 from app.models import DuplicateResult, ExtractedExpense, Observation, RunState
 from app.normalizer import normalize_expense
+from app.policy import decide_policy
 from app.repository import ExpenseRepository
 from app.storage import ObjectStorage
 from app.validator import validate_expense
@@ -29,7 +31,12 @@ class ToolRegistry:
         self.repository = repository
         self.context = context
 
-    def execute(self, tool_name: str, state: RunState) -> Observation:
+    def execute(
+        self,
+        tool_name: str,
+        state: RunState,
+        arguments: dict | None = None,
+    ) -> Observation:
         handler = getattr(self, f"_run_{tool_name}", None)
         if handler is None:
             return Observation(
@@ -37,6 +44,11 @@ class ToolRegistry:
                 summary=f"Unknown tool: {tool_name}",
                 error_code="unknown_tool",
             )
+        payload = arguments or {}
+        if tool_name == "extract_document_text":
+            return self._run_extract_document_text(state, payload)
+        if tool_name == "extract_expense_fields":
+            return self._run_extract_expense_fields(state, payload)
         return handler(state)
 
     def _run_archive_receipt(self, state: RunState) -> Observation:
@@ -50,26 +62,65 @@ class ToolRegistry:
         state.archived = True
         return Observation(success=True, summary="Receipt archive confirmed")
 
-    def _run_extract_document_text(self, state: RunState) -> Observation:
+    def _run_extract_document_text(
+        self, state: RunState, arguments: dict | None = None
+    ) -> Observation:
+        engine = (arguments or {}).get("engine") or "ocr"
         content = self.context.storage.get(state.object_key)
-        state.text = extract_document_text(content, state.content_type)
-        return Observation(success=True, summary="Document text extracted")
+        try:
+            if engine == "vision":
+                state.vision_attempted = True
+                text = extract_document_text_with_vision(
+                    content, state.content_type, self.settings
+                )
+            else:
+                state.ocr_attempted = True
+                text = extract_document_text(content, state.content_type)
+        except Exception as exc:
+            return Observation(
+                success=False,
+                summary=f"{engine} read failed: {exc}",
+                error_code="document_read_failed",
+                retryable=True,
+            )
+        _replace_document_text(state, text, engine)
+        return Observation(
+            success=True,
+            summary=f"Document text extracted via {engine} ({len(text)} chars)",
+        )
 
-    def _run_extract_expense_fields(self, state: RunState) -> Observation:
+    def _run_extract_expense_fields(
+        self, state: RunState, arguments: dict | None = None
+    ) -> Observation:
+        hint = (arguments or {}).get("hint")
         items = extract_expense_entries(
-            state.text or "", self.settings.primary_currency
+            state.text or "",
+            self.settings.primary_currency,
+            self.settings,
+            hint=hint if isinstance(hint, str) else None,
         )
         if not items:
-            items = [ExtractedExpense(currency=self.settings.primary_currency)]
+            items = [
+                ExtractedExpense(
+                    currency=self.settings.primary_currency,
+                    confidence=0.1,
+                    extraction_source="regex",
+                )
+            ]
         state.extracted_items = items
         state.extracted = items[0]
+        state.item_index = 0
         count = len(items)
+        lowest = min(item.confidence for item in items)
+        source = items[0].extraction_source
+        mixed = any(item.extraction_source != source for item in items)
+        source_label = "mixed" if mixed else source
         return Observation(
             success=True,
             summary=(
-                f"Extracted {count} expense{'s' if count != 1 else ''}"
-                if count
-                else "No expense fields extracted"
+                f"Extracted {count} expense{'s' if count != 1 else ''} via "
+                f"{source_label} (confidence {lowest:.0%})"
+                + (" with hint" if hint else "")
             ),
         )
 
@@ -102,12 +153,19 @@ class ToolRegistry:
             if len(state.extracted_items) > 1
             else (state.text or "")
         )
-        state.category = categorize_expense(
-            state.normalized.merchant_normalized, document_text
+        remembered = self.repository.lookup_merchant(
+            state.normalized.merchant_normalized
         )
+        remembered_category = remembered.category if remembered else None
+        state.category = categorize_expense(
+            state.normalized.merchant_normalized,
+            document_text,
+            remembered_category,
+        )
+        source = "merchant memory" if remembered_category else "keywords"
         return Observation(
             success=True,
-            summary=f"Expense categorized as {state.category}",
+            summary=f"Expense categorized as {state.category} via {source}",
         )
 
     def _run_check_duplicate(self, state: RunState) -> Observation:
@@ -132,15 +190,12 @@ class ToolRegistry:
         )
 
     def _run_evaluate_policy(self, state: RunState) -> Observation:
-        if state.duplicate and state.duplicate.is_duplicate:
-            state.policy_decision = "review_required"
-            summary = "Policy flagged a duplicate for review routing"
-        elif state.validation and not state.validation.valid:
-            state.policy_decision = "review_required"
-            summary = "Policy requires review because validation failed"
-        else:
-            state.policy_decision = "auto_accept"
-            summary = "Policy allows auto-accept"
+        policy = self.repository.get_or_create_policy(self.settings)
+        state.policy_min_confidence = policy.extraction_min_confidence
+        decision, reason = decide_policy(state, policy)
+        state.policy_decision = decision
+        state.policy_reason = reason
+        summary = reason or "Policy allows auto-accept"
         return Observation(success=True, summary=summary)
 
     def _run_build_final_result(self, state: RunState) -> Observation:
@@ -150,43 +205,78 @@ class ToolRegistry:
             summary=f"Final status is {state.final_status}",
         )
 
+    def _run_request_human_review(self, state: RunState) -> Observation:
+        if state.final_status != "needs_review":
+            return Observation(
+                success=False,
+                summary="Human review is only for needs_review results",
+                error_code="review_not_required",
+            )
+        expense_id = self.repository.save(state)
+        state.saved_result_id = expense_id
+        if expense_id not in state.saved_result_ids:
+            state.saved_result_ids.append(expense_id)
+        label = current_item_label(state)
+        reason = state.policy_reason or (
+            state.final_messages[0] if state.final_messages else "A human should review this receipt"
+        )
+        self.repository.record_audit(
+            "expense.review_requested",
+            state.submitted_by_user_id,
+            {"expense_id": expense_id, "job_id": state.job_id, "reason": reason},
+        )
+        if advance_to_next_item(state):
+            return Observation(
+                success=True,
+                summary=f"Paused {label} for review; continuing with the next item",
+            )
+        state.awaiting_human = True
+        return Observation(
+            success=True,
+            summary=f"Paused for human review: {reason}",
+        )
+
     def _run_save_result(self, state: RunState) -> Observation:
-        saved_ids = [self.repository.save(state)]
-        extra_items = list(state.extracted_items[1:])
-        for extracted in extra_items:
-            self._reset_item_state(state, extracted)
-            self._run_normalize_expense(state)
-            self._run_validate_expense(state)
-            self._run_categorize_expense(state)
-            self._run_check_duplicate(state)
-            self._run_evaluate_policy(state)
-            self._run_build_final_result(state)
-            saved_ids.append(self.repository.save(state))
-        state.saved_result_ids = saved_ids
-        state.saved_result_id = saved_ids[0]
-        count = len(saved_ids)
+        expense_id = self.repository.save(state)
+        state.saved_result_id = expense_id
+        if expense_id not in state.saved_result_ids:
+            state.saved_result_ids.append(expense_id)
+        label = current_item_label(state)
+        remaining = len(state.extracted_items) - len(state.saved_result_ids)
         self.repository.record_audit(
             "expense.saved",
             state.submitted_by_user_id,
             {
-                "expense_ids": saved_ids,
+                "expense_id": expense_id,
+                "expense_ids": list(state.saved_result_ids),
                 "status": state.final_status,
                 "job_id": state.job_id,
             },
         )
+        if advance_to_next_item(state):
+            return Observation(
+                success=True,
+                summary=f"Saved {label}; {remaining} remaining",
+            )
+        count = len(state.saved_result_ids) or 1
         return Observation(
             success=True,
             summary=f"Saved {count} expense{'s' if count != 1 else ''}",
         )
 
-    @staticmethod
-    def _reset_item_state(state: RunState, extracted) -> None:
-        state.extracted = extracted
-        state.normalized = None
-        state.validation = None
-        state.category = None
-        state.duplicate = None
-        state.policy_decision = None
-        state.final_status = None
-        state.final_messages = []
-        state.saved_result_id = None
+
+def _replace_document_text(state: RunState, text: str, engine: str) -> None:
+    state.text = text
+    state.document_engine = engine
+    state.extracted = None
+    state.extracted_items = []
+    state.normalized = None
+    state.validation = None
+    state.category = None
+    state.duplicate = None
+    state.policy_decision = None
+    state.policy_reason = None
+    state.final_status = None
+    state.final_messages = []
+    state.item_index = 0
+    state.saved_result_id = None

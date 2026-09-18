@@ -8,6 +8,8 @@ def evaluate_final_status(state: RunState) -> tuple[FinalStatus, list[str]]:
         ]
     if state.policy_decision == "review_required":
         messages = list(state.validation.messages) if state.validation else []
+        if state.policy_reason and state.policy_reason not in messages:
+            messages.append(state.policy_reason)
         if not messages:
             messages = ["Policy requires human review"]
         return "needs_review", messages
@@ -19,4 +21,8 @@ def evaluate_final_status(state: RunState) -> tuple[FinalStatus, list[str]]:
 
 
 def goal_completed(state: RunState) -> bool:
+    if state.extracted_items:
+        return len(state.saved_result_ids) >= len(state.extracted_items)
+    if state.awaiting_human:
+        return True
     return state.saved_result_id is not None and state.final_status is not None

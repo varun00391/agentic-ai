@@ -6,11 +6,11 @@ from app.agent import ExpenseAgent
 from app.config import Settings
 from app.db_models import Job, Organization, Receipt, User, new_id
 from app.duplicates import hash_file
-from app.models import AgentAction, RunState
+from app.models import AgentAction, ExtractedExpense, RunState
 from app.repository import ExpenseRepository
 from app.security import hash_password
 from app.storage import ObjectStorage
-from app.tools import RunContext
+from app.tools import RunContext, ToolRegistry
 from tests.conftest import RECEIPT_TEXT, STATEMENT_TEXT
 
 
@@ -158,6 +158,10 @@ def test_agent_saves_each_statement_vendor(
         60000,
         20800,
     ]
+    tools = [event.tool for event in result.trace]
+    assert tools.count("normalize_expense") == 5
+    assert tools.count("evaluate_policy") == 5
+    assert tools.count("save_result") == 5
 
 
 def test_extraction_normalization_and_validation() -> None:
@@ -206,6 +210,37 @@ def test_agent_completes_full_flow(
         "build_final_result",
         "save_result",
     ]
+    assert result.current_tool is None
+    assert result.current_reason is None
+
+
+def test_agent_checkpoints_in_progress_tool(
+    monkeypatch, settings: Settings, db_session: Session
+) -> None:
+    monkeypatch.setattr(
+        "app.tools.extract_document_text",
+        lambda content, content_type: RECEIPT_TEXT,
+    )
+    seen: list[tuple[str | None, str | None]] = []
+    original = ToolRegistry.execute
+
+    def wrapped(self, tool, state, arguments):
+        seen.append((state.current_tool, state.current_reason))
+        return original(self, tool, state, arguments)
+
+    monkeypatch.setattr(ToolRegistry, "execute", wrapped)
+    state, repository = _seed_run(db_session, settings)
+    result = ExpenseAgent(
+        settings,
+        repository,
+        RunContext(storage=ObjectStorage(settings.object_storage_path)),
+    ).process(state)
+
+    assert result.final_status == "accepted"
+    assert seen
+    assert all(tool for tool, _reason in seen)
+    assert seen[0][0] == "archive_receipt"
+    assert seen[0][1]
 
 
 def test_agent_detects_exact_duplicate(
@@ -251,7 +286,45 @@ def test_missing_total_needs_review(
     ).process(state)
 
     assert result.final_status == "needs_review"
+    assert result.awaiting_human is True
+    assert result.saved_result_id is not None
     assert "Total amount is missing or invalid" in result.final_messages
+    assert result.trace[-1].tool == "request_human_review"
+
+
+def test_low_extraction_confidence_needs_review(
+    monkeypatch, settings: Settings, db_session: Session
+) -> None:
+    monkeypatch.setattr(
+        "app.tools.extract_document_text",
+        lambda content, content_type: RECEIPT_TEXT,
+    )
+    monkeypatch.setattr(
+        "app.tools.extract_expense_entries",
+        lambda text, primary_currency, _settings=None, hint=None: [
+            ExtractedExpense(
+                merchant="Fresh Mart",
+                transaction_date="01/09/2026",
+                total="123.45",
+                currency="INR",
+                confidence=0.4,
+                extraction_source="llm",
+            )
+        ],
+    )
+    state, repository = _seed_run(db_session, settings)
+    result = ExpenseAgent(
+        settings,
+        repository,
+        RunContext(storage=ObjectStorage(settings.object_storage_path)),
+    ).process(state)
+
+    assert result.final_status == "needs_review"
+    assert result.awaiting_human is True
+    assert result.extracted is not None
+    assert result.extracted.confidence == 0.4
+    assert any("confidence" in message for message in result.final_messages)
+    assert result.trace[-1].tool == "request_human_review"
 
 
 class RepeatingPlanner:
@@ -280,3 +353,35 @@ def test_agent_stops_repeated_tool_calls(
     assert result.final_status == "failed"
     assert result.step_count == 3
     assert result.final_messages == ["Retry limit reached for extract_document_text"]
+
+
+def test_weak_ocr_retries_with_vision(
+    monkeypatch, settings: Settings, db_session: Session
+) -> None:
+    vision_settings = settings.model_copy(update={"groq_api_key": "test-key"})
+    monkeypatch.setattr(
+        "app.tools.extract_document_text",
+        lambda content, content_type: "blur",
+    )
+    monkeypatch.setattr(
+        "app.tools.extract_document_text_with_vision",
+        lambda content, content_type, _settings: RECEIPT_TEXT,
+    )
+    state, repository = _seed_run(db_session, vision_settings)
+    result = ExpenseAgent(
+        vision_settings,
+        repository,
+        RunContext(storage=ObjectStorage(vision_settings.object_storage_path)),
+    ).process(state)
+
+    assert result.ocr_attempted is True
+    assert result.vision_attempted is True
+    assert result.document_engine == "vision"
+    assert result.final_status == "accepted"
+    assert result.normalized is not None
+    assert result.normalized.total_minor_units == 12_345
+    document_steps = [
+        event.observation for event in result.trace if event.tool == "extract_document_text"
+    ]
+    assert any("via ocr" in step for step in document_steps)
+    assert any("via vision" in step for step in document_steps)

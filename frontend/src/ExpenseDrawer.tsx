@@ -5,20 +5,35 @@ import { useAuth } from "./auth";
 import {
   formatCategory,
   formatDisplayDate,
+  formatExtraction,
   formatMoney,
   formatPolicy,
-  formatToolName,
 } from "./format";
-import type { ExpenseDetail, TraceEvent } from "./types";
-import { StatusPill } from "./ui";
+import { AgentActivity } from "./AgentActivity";
+import type { ExpenseDetail } from "./types";
+import { Button, Field, StatusPill, TextInput } from "./ui";
+
+const CATEGORIES = [
+  "food_and_dining",
+  "groceries",
+  "transport",
+  "utilities",
+  "shopping",
+  "health",
+  "entertainment",
+  "travel",
+  "education",
+  "other",
+] as const;
 
 type Props = {
   expenseId: string | null;
   initial?: ExpenseDetail;
   onClose: () => void;
+  onReviewed?: (expense: ExpenseDetail) => void;
 };
 
-export function ExpenseDrawer({ expenseId, initial, onClose }: Props) {
+export function ExpenseDrawer({ expenseId, initial, onClose, onReviewed }: Props) {
   const { token, currentOrg } = useAuth();
   const [expense, setExpense] = useState<ExpenseDetail | null>(initial ?? null);
   const [error, setError] = useState("");
@@ -66,6 +81,9 @@ export function ExpenseDrawer({ expenseId, initial, onClose }: Props) {
     return null;
   }
 
+  const canReview =
+    expense?.status === "needs_review" && currentOrg?.role !== "auditor";
+
   return createPortal(
     <div className="fixed inset-0 z-50 flex justify-end">
       <button
@@ -98,7 +116,16 @@ export function ExpenseDrawer({ expenseId, initial, onClose }: Props) {
           {!error && !expense ? (
             <p className="text-sm text-muted">Opening receipt…</p>
           ) : null}
-          {expense ? <ReceiptBody expense={expense} /> : null}
+          {expense ? (
+            <ReceiptBody
+              expense={expense}
+              canReview={Boolean(canReview && token && currentOrg)}
+              onUpdated={(next) => {
+                setExpense(next);
+                onReviewed?.(next);
+              }}
+            />
+          ) : null}
         </div>
       </aside>
     </div>,
@@ -106,7 +133,15 @@ export function ExpenseDrawer({ expenseId, initial, onClose }: Props) {
   );
 }
 
-function ReceiptBody({ expense }: { expense: ExpenseDetail }) {
+function ReceiptBody({
+  expense,
+  canReview,
+  onUpdated,
+}: {
+  expense: ExpenseDetail;
+  canReview: boolean;
+  onUpdated: (expense: ExpenseDetail) => void;
+}) {
   return (
     <div>
       <div className="flex items-start justify-between gap-4">
@@ -130,12 +165,23 @@ function ReceiptBody({ expense }: { expense: ExpenseDetail }) {
         </p>
       </div>
 
-      <dl className="mt-6 divide-y divide-line overflow-hidden rounded-2xl border border-line">
-        <Fact label="Date" value={formatDisplayDate(expense.transaction_date)} />
-        <Fact label="Category" value={formatCategory(expense.category)} />
-        <Fact label="Policy" value={formatPolicy(expense.policy_decision)} />
-        <Fact label="Source file" value={expense.filename ?? "—"} />
-      </dl>
+      {canReview ? (
+        <ReviewForm expense={expense} onUpdated={onUpdated} />
+      ) : (
+        <dl className="mt-6 divide-y divide-line overflow-hidden rounded-2xl border border-line">
+          <Fact label="Date" value={formatDisplayDate(expense.transaction_date)} />
+          <Fact label="Category" value={formatCategory(expense.category)} />
+          <Fact
+            label="Extraction"
+            value={formatExtraction(
+              expense.extraction_confidence,
+              expense.extraction_source,
+            )}
+          />
+          <Fact label="Policy" value={formatPolicy(expense.policy_decision)} />
+          <Fact label="Source file" value={expense.filename ?? "—"} />
+        </dl>
+      )}
 
       {expense.duplicate_of_expense_id ? (
         <p className="mt-4 rounded-2xl bg-sky-50 px-4 py-3 text-sm text-sky-950">
@@ -159,40 +205,163 @@ function ReceiptBody({ expense }: { expense: ExpenseDetail }) {
       ) : null}
 
       {expense.trace.length > 0 ? (
-        <section className="mt-8 pb-4">
-          <h3 className="text-[11px] font-semibold tracking-[0.14em] text-muted uppercase">
-            How this was processed
-          </h3>
-          <ol className="mt-4 space-y-0">
-            {expense.trace.map((event, index) => (
-              <li key={`${event.step}-${event.tool}`} className="flex gap-3">
-                <div className="flex flex-col items-center">
-                  <span
-                    className={`mt-1 h-2.5 w-2.5 rounded-full ${
-                      event.success ? "bg-void" : "bg-rose-600"
-                    }`}
-                  />
-                  {index < expense.trace.length - 1 ? (
-                    <span className="w-px flex-1 bg-line" />
-                  ) : null}
-                </div>
-                <div className="pb-5">
-                  <div className="flex items-baseline justify-between gap-3">
-                    <p className="text-sm font-medium">{formatToolName(event.tool)}</p>
-                    <p className="text-[11px] tracking-wide text-muted uppercase">
-                      {event.success ? "Done" : "Failed"}
-                    </p>
-                  </div>
-                  <p className="mt-1 text-sm leading-6 text-muted">
-                    {formatObservation(event)}
-                  </p>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </section>
+        <div className="mt-8 pb-4">
+          <AgentActivity
+            compact
+            filename={expense.filename ?? "Receipt"}
+            status={expense.status}
+            progress={{
+              step_count: expense.step_count,
+              current_tool: null,
+              current_reason: null,
+              current_arguments: {},
+              merchant: expense.merchant,
+              total:
+                expense.total_minor_units === null
+                  ? null
+                  : (expense.total_minor_units / 100).toFixed(2),
+              currency: expense.currency,
+              category: expense.category,
+              extraction_confidence: expense.extraction_confidence,
+              extraction_source: expense.extraction_source,
+              policy_decision: expense.policy_decision,
+              final_status: expense.status,
+              item_index: 0,
+              item_count: 0,
+              trace: expense.trace,
+            }}
+          />
+        </div>
       ) : null}
     </div>
+  );
+}
+
+function ReviewForm({
+  expense,
+  onUpdated,
+}: {
+  expense: ExpenseDetail;
+  onUpdated: (expense: ExpenseDetail) => void;
+}) {
+  const { token, currentOrg } = useAuth();
+  const [merchant, setMerchant] = useState(expense.merchant ?? "");
+  const [transactionDate, setTransactionDate] = useState(expense.transaction_date ?? "");
+  const [total, setTotal] = useState(amountInput(expense.total_minor_units));
+  const [category, setCategory] = useState(expense.category ?? "other");
+  const [busy, setBusy] = useState<"approve" | "edit" | "reject" | "">("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setMerchant(expense.merchant ?? "");
+    setTransactionDate(expense.transaction_date ?? "");
+    setTotal(amountInput(expense.total_minor_units));
+    setCategory(expense.category ?? "other");
+    setError("");
+  }, [expense.expense_id]);
+
+  async function submit(decision: "approve" | "edit" | "reject") {
+    if (!token || !currentOrg) {
+      return;
+    }
+    setBusy(decision);
+    setError("");
+    try {
+      const payload =
+        decision === "reject"
+          ? { decision }
+          : decision === "approve"
+            ? { decision }
+            : {
+                decision,
+                merchant,
+                transaction_date: transactionDate,
+                total,
+                category,
+              };
+      const next = await api.reviewExpense(
+        token,
+        currentOrg.id,
+        expense.expense_id,
+        payload,
+      );
+      onUpdated(next);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Unable to save this review");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <section className="mt-6 rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
+      <p className="text-[11px] font-semibold tracking-[0.14em] text-amber-900 uppercase">
+        Waiting for review
+      </p>
+      <p className="mt-1 text-sm leading-6 text-amber-950/80">
+        The agent paused here. Approve the guessed fields, edit them, or reject the
+        receipt.
+      </p>
+      <div className="mt-4 space-y-3">
+        <Field label="Merchant">
+          <TextInput value={merchant} onChange={(event) => setMerchant(event.target.value)} />
+        </Field>
+        <Field label="Date">
+          <TextInput
+            value={transactionDate}
+            placeholder="2026-09-01"
+            onChange={(event) => setTransactionDate(event.target.value)}
+          />
+        </Field>
+        <Field label="Amount">
+          <TextInput
+            value={total}
+            inputMode="decimal"
+            placeholder="123.45"
+            onChange={(event) => setTotal(event.target.value)}
+          />
+        </Field>
+        <Field label="Category">
+          <select
+            className="h-11 w-full rounded-xl border border-line bg-card px-3.5 text-sm text-ink"
+            value={category}
+            onChange={(event) => setCategory(event.target.value)}
+          >
+            {CATEGORIES.map((item) => (
+              <option key={item} value={item}>
+                {formatCategory(item)}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      {error ? <p className="mt-3 text-sm text-rose-800">{error}</p> : null}
+      <div className="mt-4 flex flex-col gap-2">
+        <Button
+          type="button"
+          disabled={Boolean(busy)}
+          onClick={() => submit("approve")}
+        >
+          {busy === "approve" ? "Approving…" : "Approve as-is"}
+        </Button>
+        <Button
+          type="button"
+          className="border border-line bg-card text-ink hover:bg-paper"
+          disabled={Boolean(busy)}
+          onClick={() => submit("edit")}
+        >
+          {busy === "edit" ? "Saving…" : "Save edits"}
+        </Button>
+        <Button
+          type="button"
+          tone="danger"
+          disabled={Boolean(busy)}
+          onClick={() => submit("reject")}
+        >
+          {busy === "reject" ? "Rejecting…" : "Reject"}
+        </Button>
+      </div>
+    </section>
   );
 }
 
@@ -205,12 +374,9 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function formatObservation(event: TraceEvent): string {
-  if (event.tool === "save_result" && event.success) {
-    return "Saved to your ledger";
+function amountInput(totalMinorUnits: number | null): string {
+  if (totalMinorUnits === null) {
+    return "";
   }
-  if (event.tool === "build_final_result") {
-    return event.observation.replaceAll("_", " ");
-  }
-  return event.observation;
+  return (totalMinorUnits / 100).toFixed(2);
 }

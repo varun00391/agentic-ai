@@ -21,12 +21,15 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 15
     max_batch_files: int = 10
     max_total_minor_units: int = 100_000_000
-    max_agent_steps: int = 16
+    max_agent_steps: int = 80
     max_tool_retries: int = 2
     planner: str = "auto"
     model: str = "qwen/qwen3.8-27b"
     groq_api_key: str | None = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
+    extraction_min_confidence: float = 0.7
+    extraction_max_chars: int = 8000
+    vision_model: str = ""
     retain_ocr_text: bool = False
     bootstrap_email: str | None = None
     bootstrap_password: str | None = None
@@ -35,6 +38,10 @@ class Settings(BaseSettings):
     max_job_attempts: int = 3
     worker_poll_seconds: float = 1.0
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
+
+    @property
+    def vision_model_name(self) -> str:
+        return self.vision_model.strip() or self.model
 
     @property
     def max_file_size_bytes(self) -> int:
