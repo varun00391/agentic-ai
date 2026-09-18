@@ -1,0 +1,113 @@
+Metadata-Version: 2.4
+Name: expense-agent-v2
+Version: 0.2.0
+Summary: Production multi-tenant expense capture platform
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: bcrypt==4.3.0
+Requires-Dist: fastapi==0.141.1
+Requires-Dist: numpy==2.2.6
+Requires-Dist: openai==1.109.1
+Requires-Dist: pillow==11.3.0
+Requires-Dist: psycopg[binary]==3.2.10
+Requires-Dist: pydantic==2.13.5
+Requires-Dist: pydantic-settings==2.15.0
+Requires-Dist: pymupdf==1.28.2
+Requires-Dist: pyjwt==2.10.1
+Requires-Dist: python-multipart==0.0.32
+Requires-Dist: sqlalchemy==2.0.43
+Requires-Dist: uvicorn[standard]==0.52.4
+Provides-Extra: dev
+Requires-Dist: httpx==0.28.1; extra == "dev"
+Requires-Dist: pytest==8.4.2; extra == "dev"
+Provides-Extra: ocr
+Requires-Dist: paddleocr==3.7.0; extra == "ocr"
+Requires-Dist: torch==2.14.0; extra == "ocr"
+Requires-Dist: torchvision==0.29.0; extra == "ocr"
+Requires-Dist: transformers==5.17.0; extra == "ocr"
+
+# Expense Capture Platform (v2)
+
+Production-oriented multi-tenant expense capture. This tree is independent of
+`v1/` and does not import Version 1 modules.
+
+After sign-in, members upload JPEG, PNG, or PDF receipts. The API stores the
+original file, enqueues a job, and returns immediately. A worker runs the
+bounded agent loop, then writes an organization-scoped expense.
+
+This release covers delivery phases 1 and 2: identity, tenant isolation,
+PostgreSQL, local object storage, asynchronous jobs, and the rewritten agent
+loop. Email ingestion, fuzzy duplicates, a full review UI, and accounting
+connectors are not included yet.
+
+## Run with Docker
+
+```bash
+cd v2
+cp .env.example .env
+docker compose up --build
+```
+
+Open:
+
+- API docs: http://localhost:8000/docs
+- Health: http://localhost:8000/health
+
+Bootstrap login from `.env`:
+
+- Email: `owner@example.com`
+- Password: `change-me-now`
+
+Change those values before any shared deployment.
+
+## Run locally
+
+PostgreSQL is required for the Docker stack. Local tests use SQLite.
+
+```bash
+cd v2
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+export EXPENSE_V2_DATABASE_URL=sqlite+pysqlite:///data/expense-v2.db
+export EXPENSE_V2_JWT_SECRET=dev-only-change-me
+export EXPENSE_V2_BOOTSTRAP_EMAIL=owner@example.com
+export EXPENSE_V2_BOOTSTRAP_PASSWORD=change-me-now
+uvicorn app.api:app --reload
+```
+
+In another terminal, from `v2/`:
+
+```bash
+source .venv/bin/activate
+python -m app.worker
+```
+
+Install `[ocr]` only when you want real PaddleOCR inference. Tests mock document
+text extraction.
+
+## API flow
+
+1. `POST /api/v2/auth/signup` or `POST /api/v2/auth/login`
+2. Send `Authorization: Bearer <token>` and `X-Organization-Id: <org id>`
+3. `POST /api/v2/receipts` with one or more files (optional `Idempotency-Key`)
+4. Poll `GET /api/v2/jobs/{job_id}` until `succeeded`
+5. Read `GET /api/v2/expenses/{expense_id}`
+
+## Tests
+
+```bash
+cd v2
+pip install -e ".[dev]"
+pytest
+```
+
+## Local-dev defaults
+
+These are local defaults, not launch vendor choices:
+
+- Identity: email/password JWT (OIDC is not wired yet)
+- Database: PostgreSQL 16 in Docker, SQLite in tests
+- Object storage: filesystem under `data/objects`
+- Jobs: PostgreSQL/SQLite table plus a custom worker
+- Malware scan: magic-byte and type checks only

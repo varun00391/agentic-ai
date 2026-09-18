@@ -1,0 +1,102 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${EXPENSE_V2_POSTGRES_USER:-expense}
+      POSTGRES_PASSWORD: ${EXPENSE_V2_POSTGRES_PASSWORD:-expense}
+      POSTGRES_DB: ${EXPENSE_V2_POSTGRES_DB:-expense_v2}
+    ports:
+      - "${EXPENSE_V2_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${EXPENSE_V2_POSTGRES_USER:-expense} -d ${EXPENSE_V2_POSTGRES_DB:-expense_v2}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: expense-agent-v2-backend:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      EXPENSE_V2_DATABASE_URL: postgresql+psycopg://${EXPENSE_V2_POSTGRES_USER:-expense}:${EXPENSE_V2_POSTGRES_PASSWORD:-expense}@postgres:5432/${EXPENSE_V2_POSTGRES_DB:-expense_v2}
+      EXPENSE_V2_OBJECT_STORAGE_PATH: /app/data/objects
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    ports:
+      - "${EXPENSE_V2_API_PORT:-8000}:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - paddle-models:/home/expense-agent/.paddlex
+    depends_on:
+      postgres:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    image: expense-agent-v2-backend:local
+    init: true
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file:
+      - .env
+    environment:
+      EXPENSE_V2_DATABASE_URL: postgresql+psycopg://${EXPENSE_V2_POSTGRES_USER:-expense}:${EXPENSE_V2_POSTGRES_PASSWORD:-expense}@postgres:5432/${EXPENSE_V2_POSTGRES_DB:-expense_v2}
+      EXPENSE_V2_OBJECT_STORAGE_PATH: /app/data/objects
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+    volumes:
+      - ./backend/data:/app/data
+      - paddle-models:/home/expense-agent/.paddlex
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+    image: expense-agent-v2-frontend:local
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${EXPENSE_V2_FRONTEND_PORT:-3000}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  paddle-models:
