@@ -1,3 +1,23 @@
+# Environment / secrets
 .env
-.env.example
+.env.*
+!.env.example
+
+# OS
 .DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend build
+node_modules/
+dist/
+
+# Local object storage (uploaded receipts)
+backend/data/objects/
