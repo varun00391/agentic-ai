@@ -3,8 +3,9 @@ from collections.abc import Callable
 from app.config import Settings
 from app.evaluator import goal_completed
 from app.guardrails import validate_action
+from app.items import advance_to_next_item
 from app.models import Observation, RunState, TraceEvent
-from app.planner import Planner, create_planner
+from app.planner import Planner, RuleBasedPlanner, create_planner
 from app.repository import ExpenseRepository
 from app.tools import RunContext, ToolRegistry
 
@@ -34,6 +35,7 @@ class ExpenseAgent:
         while state.step_count < self.settings.max_agent_steps:
             self._set_working(state, None, "Deciding the next step")
             self._checkpoint(state)
+            was_degraded = bool(getattr(self.planner, "degraded", False))
             try:
                 action = self.planner.choose_action(state, latest_observation)
             except Exception as exc:
@@ -51,9 +53,31 @@ class ExpenseAgent:
                 )
                 self._checkpoint(state)
                 if planner_failures >= self.settings.max_tool_retries:
-                    self._force_failure(state, "Planner retry limit reached")
-                    break
+                    self._use_rule_based_planner()
+                    if self._fail_current_item(state, "Planner retry limit reached"):
+                        break
+                    planner_failures = 0
                 continue
+
+            planner_failures = 0
+            if getattr(self.planner, "degraded", False) and not was_degraded:
+                state.step_count += 1
+                latest_observation = Observation(
+                    success=True,
+                    summary=(
+                        "Groq is temporarily unavailable; finishing remaining "
+                        "expenses with the local planner"
+                    ),
+                    error_code="planner_rate_limited",
+                )
+                self._clear_working(state)
+                self._append_trace(
+                    state,
+                    "planner",
+                    "Keep processing after Groq became unavailable",
+                    latest_observation,
+                )
+                self._checkpoint(state)
 
             state.step_count += 1
             guard_error = validate_action(
@@ -70,8 +94,8 @@ class ExpenseAgent:
                 self._append_trace(state, action.tool, action.reason, latest_observation)
                 self._checkpoint(state)
                 if "Retry limit reached" in guard_error:
-                    self._force_failure(state, guard_error)
-                    break
+                    if self._fail_current_item(state, guard_error):
+                        break
                 continue
 
             state.tool_attempts[action.tool] = (
@@ -106,19 +130,25 @@ class ExpenseAgent:
                 self.repository.update_trace(state.saved_result_ids[-1], state)
 
             if not latest_observation.success and not latest_observation.retryable:
-                self._force_failure(state, latest_observation.summary)
-                break
+                if self._fail_current_item(state, latest_observation.summary):
+                    break
+                continue
             if goal_completed(state):
                 break
         else:
-            self._force_failure(state, "Maximum agent steps reached")
+            self._fail_unfinished_items(state, "Maximum agent steps reached")
 
         if state.awaiting_human:
             self._clear_working(state)
             self._checkpoint(state)
             return state
-        if state.final_status is None:
-            self._force_failure(state, "Agent stopped without a final result")
+        if not goal_completed(state):
+            self._fail_unfinished_items(
+                state,
+                state.final_messages[0]
+                if state.final_messages
+                else "Agent stopped without a final result",
+            )
         self._clear_working(state)
         self._checkpoint(state)
         return state
@@ -162,14 +192,37 @@ class ExpenseAgent:
             )
         )
 
-    def _force_failure(self, state: RunState, reason: str) -> None:
-        if state.awaiting_human or state.saved_result_id is not None:
-            return
+    def _use_rule_based_planner(self) -> None:
+        if not isinstance(self.planner, RuleBasedPlanner):
+            self.planner = RuleBasedPlanner(self.settings)
+
+    def _fail_current_item(self, state: RunState, reason: str) -> bool:
+        """Persist the current item as failed. Return True if the run should stop."""
+        if state.awaiting_human:
+            return True
+        if state.saved_result_id is None:
+            state.final_status = "failed"
+            state.final_messages = [reason]
+            self._clear_working(state)
+            try:
+                expense_id = self.repository.save(state)
+            except Exception:
+                expense_id = None
+            state.saved_result_id = expense_id
+            if expense_id and expense_id not in state.saved_result_ids:
+                state.saved_result_ids.append(expense_id)
+                try:
+                    self.repository.update_trace(expense_id, state)
+                except Exception:
+                    pass
+            self._checkpoint(state)
+        if state.extracted_items and advance_to_next_item(state):
+            self._use_rule_based_planner()
+            return False
+        return True
+
+    def _fail_unfinished_items(self, state: RunState, reason: str) -> None:
+        while not self._fail_current_item(state, reason):
+            pass
         self._clear_working(state)
-        state.final_status = "failed"
-        state.final_messages = [reason]
-        try:
-            state.saved_result_id = self.repository.save(state)
-        except Exception:
-            state.saved_result_id = None
         self._checkpoint(state)

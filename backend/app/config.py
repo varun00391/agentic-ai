@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     max_total_minor_units: int = 100_000_000
     max_agent_steps: int = 80
     max_tool_retries: int = 2
+    planner_rate_limit_retries: int = 2
+    planner_rate_limit_max_wait_seconds: float = 15.0
     planner: str = "auto"
     model: str = "qwen/qwen3.8-27b"
     groq_api_key: str | None = None

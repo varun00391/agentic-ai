@@ -1,12 +1,15 @@
 import json
+import time
 from typing import Protocol
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
 from app.config import Settings
 from app.items import remaining_item_count
 from app.models import AgentAction, Observation, RunState
 from app.policy import min_confidence
+
+RETRYABLE_PROVIDER_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError)
 
 
 GOAL_PLANNER_PROMPT = """You orchestrate one receipt-processing run.
@@ -109,8 +112,32 @@ class GroqPlanner:
             timeout=30.0,
         )
         self.model = settings.model
+        self._fallback = RuleBasedPlanner(settings)
+        self.degraded = False
 
     def choose_action(
+        self, state: RunState, latest_observation: Observation | None
+    ) -> AgentAction:
+        if self.degraded or state.extracted is not None:
+            return self._fallback.choose_action(state, latest_observation)
+        attempts = self.settings.planner_rate_limit_retries + 1
+        for attempt in range(attempts):
+            try:
+                return self._choose_from_groq(state, latest_observation)
+            except RETRYABLE_PROVIDER_ERRORS as exc:
+                if attempt >= attempts - 1:
+                    break
+                time.sleep(
+                    rate_limit_wait_seconds(
+                        exc,
+                        attempt,
+                        self.settings.planner_rate_limit_max_wait_seconds,
+                    )
+                )
+        self.degraded = True
+        return self._fallback.choose_action(state, latest_observation)
+
+    def _choose_from_groq(
         self, state: RunState, latest_observation: Observation | None
     ) -> AgentAction:
         extracted = state.extracted
@@ -225,3 +252,27 @@ def _text_is_weak(text: str | None) -> bool:
     if not text:
         return True
     return len(text.strip()) < 20
+
+
+def rate_limit_wait_seconds(
+    exc: BaseException, attempt: int, max_wait: float
+) -> float:
+    wait = min(max_wait, float(2**attempt))
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return wait
+    retry_after = getter("retry-after") or getter("Retry-After")
+    retry_after_ms = getter("retry-after-ms") or getter("x-ratelimit-reset-tokens")
+    if retry_after:
+        try:
+            wait = max(wait, float(retry_after))
+        except (TypeError, ValueError):
+            pass
+    elif retry_after_ms:
+        try:
+            wait = max(wait, float(retry_after_ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass
+    return min(max_wait, wait)

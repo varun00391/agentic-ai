@@ -10,6 +10,7 @@ from app.models import AgentAction, ExtractedExpense, RunState
 from app.repository import ExpenseRepository
 from app.security import hash_password
 from app.storage import ObjectStorage
+from app.planner import RuleBasedPlanner
 from app.tools import RunContext, ToolRegistry
 from tests.conftest import RECEIPT_TEXT, STATEMENT_TEXT
 
@@ -335,6 +336,20 @@ class RepeatingPlanner:
         )
 
 
+class FailOnSecondItemPlanner:
+    def __init__(self, settings: Settings) -> None:
+        self.inner = RuleBasedPlanner(settings)
+
+    def choose_action(self, state, latest_observation):
+        if (
+            state.item_index == 1
+            and state.duplicate is not None
+            and state.policy_decision is None
+        ):
+            raise ValueError("simulated RateLimitError")
+        return self.inner.choose_action(state, latest_observation)
+
+
 def test_agent_stops_repeated_tool_calls(
     monkeypatch, settings: Settings, db_session: Session
 ) -> None:
@@ -353,6 +368,46 @@ def test_agent_stops_repeated_tool_calls(
     assert result.final_status == "failed"
     assert result.step_count == 3
     assert result.final_messages == ["Retry limit reached for extract_document_text"]
+
+
+def test_planner_failure_still_finishes_remaining_statement_items(
+    monkeypatch, settings: Settings, db_session: Session
+) -> None:
+    monkeypatch.setattr(
+        "app.tools.extract_document_text",
+        lambda content, content_type: STATEMENT_TEXT,
+    )
+    state, repository = _seed_run(db_session, settings)
+    result = ExpenseAgent(
+        settings,
+        repository,
+        RunContext(storage=ObjectStorage(settings.object_storage_path)),
+        planner=FailOnSecondItemPlanner(settings),
+    ).process(state)
+
+    from sqlalchemy import select
+
+    from app.db_models import Expense
+
+    expenses = db_session.scalars(
+        select(Expense).where(Expense.job_id == state.job_id).order_by(Expense.created_at)
+    ).all()
+    assert [row.merchant_raw for row in expenses] == [
+        "SHARMA MEDICAL STORE",
+        "SANJEEV KUMAR",
+        "ZEEVA HEALTHCARE",
+        "ZEEVA HEALTHCARE",
+        "AHSAN TEA SHOP",
+    ]
+    assert [row.status for row in expenses] == [
+        "accepted",
+        "failed",
+        "accepted",
+        "accepted",
+        "accepted",
+    ]
+    assert "Planner retry limit reached" in (expenses[1].validation_messages_json or [])
+    assert len(result.saved_result_ids) == 5
 
 
 def test_weak_ocr_retries_with_vision(

@@ -1,10 +1,14 @@
 import json
+import time
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.models import ExtractedExpense
+from app.planner import rate_limit_wait_seconds
+
+RETRYABLE_PROVIDER_ERRORS = (RateLimitError, APITimeoutError, APIConnectionError)
 
 
 class LlmExpenseItem(BaseModel):
@@ -57,24 +61,42 @@ def extract_expenses_with_llm(
         base_url=settings.groq_base_url,
         timeout=30.0,
     )
-    response = client.chat.completions.create(
-        model=settings.model,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "primary_currency": primary_currency,
-                        "ocr_text": clipped,
-                        "hint": (hint or "")[:200] or None,
-                    }
-                ),
-            },
-        ],
-    )
+    messages = [
+        {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "primary_currency": primary_currency,
+                    "ocr_text": clipped,
+                    "hint": (hint or "")[:200] or None,
+                }
+            ),
+        },
+    ]
+    response = None
+    attempts = settings.planner_rate_limit_retries + 1
+    for attempt in range(attempts):
+        try:
+            response = client.chat.completions.create(
+                model=settings.model,
+                temperature=0,
+                response_format={"type": "json_object"},
+                messages=messages,
+            )
+            break
+        except RETRYABLE_PROVIDER_ERRORS as exc:
+            if attempt >= attempts - 1:
+                raise LlmExtractionError("Extractor hit a Groq rate limit") from exc
+            time.sleep(
+                rate_limit_wait_seconds(
+                    exc,
+                    attempt,
+                    settings.planner_rate_limit_max_wait_seconds,
+                )
+            )
+    if response is None:
+        raise LlmExtractionError("Extractor returned no response")
     content = response.choices[0].message.content
     if not content:
         raise LlmExtractionError("Extractor returned an empty response")
